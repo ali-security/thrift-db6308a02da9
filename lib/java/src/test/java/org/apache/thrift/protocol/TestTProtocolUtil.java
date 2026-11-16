@@ -18,13 +18,23 @@
  */
 package org.apache.thrift.protocol;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.ByteArrayOutputStream;
+import org.apache.thrift.TException;
 import org.apache.thrift.TSerializer;
+import org.apache.thrift.transport.TMemoryInputTransport;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.Isolated;
 import thrift.test.GuessProtocolStruct;
 
+// Isolated: testSetMaxSkipDepthIsHonored changes the JVM-wide skip depth of TProtocolUtil, so no
+// other test may run concurrently with this class.
+@Isolated
 public class TestTProtocolUtil {
 
   @Test
@@ -89,5 +99,77 @@ public class TestTProtocolUtil {
     TProtocolFactory factory =
         TProtocolUtil.guessProtocolFactory(buf, new TSimpleJSONProtocol.Factory());
     assertTrue(factory instanceof TSimpleJSONProtocol.Factory);
+  }
+
+  private static byte[] craftNestedStructs(int depth) throws Exception {
+    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+    for (int i = 0; i < depth; i++) {
+      baos.write(TType.STRUCT); // field type
+      baos.write(0x00); // field ID high byte
+      baos.write(0x01); // field ID low byte (id=1)
+    }
+    for (int i = 0; i <= depth; i++) {
+      baos.write(TType.STOP); // STOP for each level + innermost
+    }
+    return baos.toByteArray();
+  }
+
+  private static TBinaryProtocol protocolFor(byte[] payload) throws Exception {
+    return new TBinaryProtocol(new TMemoryInputTransport(payload));
+  }
+
+  @Test
+  public void testSkipDefaultDepthRejectsDeeplyNestedStruct() throws Exception {
+    byte[] payload = craftNestedStructs(64);
+    TMemoryInputTransport trans = new TMemoryInputTransport(payload);
+    TBinaryProtocol proto = new TBinaryProtocol(trans);
+    assertThrows(TException.class, () -> TProtocolUtil.skip(proto, TType.STRUCT));
+  }
+
+  @Test
+  public void testSkipDefaultDepthAcceptsStructWithinLimit() throws Exception {
+    byte[] payload = craftNestedStructs(63);
+    TMemoryInputTransport trans = new TMemoryInputTransport(payload);
+    TBinaryProtocol proto = new TBinaryProtocol(trans);
+    TProtocolUtil.skip(proto, TType.STRUCT); // must not throw
+  }
+
+  @Test
+  public void testSkipDeeplyNestedStructDoesNotOverflowStack() throws Exception {
+    byte[] payload = craftNestedStructs(100000);
+
+    TBinaryProtocol utilProto = protocolFor(payload);
+    TProtocolException utilException =
+        assertThrows(TProtocolException.class, () -> TProtocolUtil.skip(utilProto, TType.STRUCT));
+    assertEquals(TProtocolException.DEPTH_LIMIT, utilException.getType());
+
+    TBinaryProtocol proto = protocolFor(payload);
+    TProtocolException protoException =
+        assertThrows(TProtocolException.class, () -> proto.skip(TType.STRUCT));
+    assertEquals(TProtocolException.DEPTH_LIMIT, protoException.getType());
+  }
+
+  @Test
+  public void testSetMaxSkipDepthIsHonored() throws Exception {
+    try {
+      TProtocolUtil.setMaxSkipDepth(100);
+      byte[] deepPayload = craftNestedStructs(80);
+      assertDoesNotThrow(() -> TProtocolUtil.skip(protocolFor(deepPayload), TType.STRUCT));
+      assertDoesNotThrow(() -> protocolFor(deepPayload).skip(TType.STRUCT));
+
+      TProtocolUtil.setMaxSkipDepth(3);
+      byte[] shallowPayload = craftNestedStructs(5);
+      TProtocolException utilException =
+          assertThrows(
+              TProtocolException.class,
+              () -> TProtocolUtil.skip(protocolFor(shallowPayload), TType.STRUCT));
+      assertEquals(TProtocolException.DEPTH_LIMIT, utilException.getType());
+      TProtocolException protoException =
+          assertThrows(
+              TProtocolException.class, () -> protocolFor(shallowPayload).skip(TType.STRUCT));
+      assertEquals(TProtocolException.DEPTH_LIMIT, protoException.getType());
+    } finally {
+      TProtocolUtil.resetMaxSkipDepth();
+    }
   }
 }

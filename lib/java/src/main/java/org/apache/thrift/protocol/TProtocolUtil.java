@@ -19,7 +19,9 @@
 
 package org.apache.thrift.protocol;
 
+import org.apache.thrift.TConfiguration;
 import org.apache.thrift.TException;
+import org.apache.thrift.transport.TTransport;
 
 /** Utility class with static methods for interacting with protocol data streams. */
 public class TProtocolUtil {
@@ -28,11 +30,16 @@ public class TProtocolUtil {
   private TProtocolUtil() {}
 
   /** The maximum recursive depth the skip() function will traverse before throwing a TException. */
-  private static int maxSkipDepth = Integer.MAX_VALUE;
+  private static volatile int maxSkipDepth = TConfiguration.DEFAULT_RECURSION_DEPTH;
+
+  /** Whether {@link #setMaxSkipDepth(int)} has been called to override the default skip depth. */
+  private static volatile boolean maxSkipDepthSet = false;
 
   /**
    * Specifies the maximum recursive depth that the skip function will traverse before throwing a
    * TException. This is a global setting, so any call to skip in this JVM will enforce this value.
+   * When this method has never been called, the default is the recursion limit of the protocol's
+   * transport {@link TConfiguration}.
    *
    * @param depth the maximum recursive depth. A value of 2 would allow the skip function to skip a
    *     structure or collection with basic children, but it would not permit skipping a struct that
@@ -41,6 +48,36 @@ public class TProtocolUtil {
    */
   public static void setMaxSkipDepth(int depth) {
     maxSkipDepth = depth;
+    maxSkipDepthSet = true;
+  }
+
+  /** Restores the default skip depth, as if {@link #setMaxSkipDepth(int)} was never called. */
+  static void resetMaxSkipDepth() {
+    maxSkipDepthSet = false;
+    maxSkipDepth = TConfiguration.DEFAULT_RECURSION_DEPTH;
+  }
+
+  /**
+   * Returns the maximum recursive depth to use when skipping without an explicit depth: the value
+   * given to {@link #setMaxSkipDepth(int)} if it was called, otherwise the recursion limit of the
+   * protocol's transport configuration.
+   *
+   * @param prot the protocol object to read from
+   * @return the maximum recursive skip depth
+   */
+  static int defaultSkipDepth(TProtocol prot) {
+    if (maxSkipDepthSet) {
+      return maxSkipDepth;
+    }
+    TTransport transport = prot.getTransport();
+    if (transport == null) {
+      return TConfiguration.DEFAULT_RECURSION_DEPTH;
+    }
+    TConfiguration config = transport.getConfiguration();
+    if (config == null) {
+      return TConfiguration.DEFAULT_RECURSION_DEPTH;
+    }
+    return config.getRecursionLimit();
   }
 
   /**
@@ -50,7 +87,7 @@ public class TProtocolUtil {
    * @param type the next value will be interpreted as this TType value.
    */
   public static void skip(TProtocol prot, byte type) throws TException {
-    skip(prot, type, maxSkipDepth);
+    skip(prot, type, defaultSkipDepth(prot));
   }
 
   /**
@@ -63,7 +100,7 @@ public class TProtocolUtil {
    */
   public static void skip(TProtocol prot, byte type, int maxDepth) throws TException {
     if (maxDepth <= 0) {
-      throw new TException("Maximum skip depth exceeded");
+      throw new TProtocolException(TProtocolException.DEPTH_LIMIT, "Maximum skip depth exceeded");
     }
     switch (type) {
       case TType.BOOL:
