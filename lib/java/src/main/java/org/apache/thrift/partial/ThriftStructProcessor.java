@@ -21,10 +21,11 @@ package org.apache.thrift.partial;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import org.apache.thrift.TBase;
+import org.apache.thrift.TBaseHelper;
 import org.apache.thrift.TEnum;
 import org.apache.thrift.TFieldIdEnum;
 
@@ -47,24 +48,40 @@ public class ThriftStructProcessor implements ThriftFieldValueProcessor<TBase> {
     return (TBase) instance;
   }
 
+  /**
+   * The {@code expectedSize} of a list, map or set is the element count declared by its container
+   * header on the wire. It is only used as a (capped) initial capacity hint; the containers grow
+   * as elements are actually read, so a header naming a count that is never backed by data cannot
+   * force an outsized allocation up front.
+   */
   @Override
   public Object createNewList(int expectedSize) {
-    return new Object[expectedSize];
+    return new ArrayList<Object>(TBaseHelper.preallocSize(expectedSize));
   }
 
   @Override
   public void setListElement(Object instance, int index, Object value) {
-    ((Object[]) instance)[index] = value;
+    ArrayList<Object> list = (ArrayList<Object>) instance;
+    // Elements are normally set in order, which simply appends; pad any gap so that an
+    // out-of-order element still lands at its index.
+    while (list.size() < index) {
+      list.add(null);
+    }
+    if (index < list.size()) {
+      list.set(index, value);
+    } else {
+      list.add(value);
+    }
   }
 
   @Override
   public Object prepareList(Object instance) {
-    return Arrays.asList((Object[]) instance);
+    return instance;
   }
 
   @Override
   public Object createNewMap(int expectedSize) {
-    return new HashMap<Object, Object>(expectedSize);
+    return new HashMap<Object, Object>(TBaseHelper.preallocSize(expectedSize));
   }
 
   @Override
@@ -79,7 +96,7 @@ public class ThriftStructProcessor implements ThriftFieldValueProcessor<TBase> {
 
   @Override
   public Object createNewSet(int expectedSize) {
-    return new HashSet<Object>(expectedSize);
+    return new HashSet<Object>(TBaseHelper.preallocSize(expectedSize));
   }
 
   @Override

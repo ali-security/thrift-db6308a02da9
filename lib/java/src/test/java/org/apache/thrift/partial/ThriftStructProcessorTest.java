@@ -67,16 +67,17 @@ public class ThriftStructProcessorTest {
     ThriftStructProcessor processor = new ThriftStructProcessor();
     Object instance = processor.createNewList(numItems);
     assertNotNull(instance);
-    assertTrue(instance instanceof Object[]);
+    assertTrue(instance instanceof List<?>);
 
-    Object[] items = (Object[]) instance;
+    List<?> items = (List<?>) instance;
     for (int i = 0; i < numItems; i++) {
-      assertNull(items[i]);
+      assertEquals(i, items.size());
       processor.setListElement(instance, i, Integer.valueOf(i));
-      assertEquals(i, items[i]);
+      assertEquals(i, items.get(i));
     }
 
     assertTrue(processor.prepareList(instance) instanceof List<?>);
+    assertEquals(numItems, ((List<?>) processor.prepareList(instance)).size());
   }
 
   @Test

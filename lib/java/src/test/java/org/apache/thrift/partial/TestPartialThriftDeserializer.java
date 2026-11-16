@@ -41,6 +41,16 @@ import org.apache.thrift.TDeserializer;
 import org.apache.thrift.TException;
 import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.protocol.TCompactProtocol;
+import org.apache.thrift.protocol.TField;
+import org.apache.thrift.protocol.TList;
+import org.apache.thrift.protocol.TMap;
+import org.apache.thrift.protocol.TProtocol;
+import org.apache.thrift.protocol.TProtocolFactory;
+import org.apache.thrift.protocol.TSet;
+import org.apache.thrift.protocol.TStruct;
+import org.apache.thrift.protocol.TType;
+import org.apache.thrift.transport.TMemoryBuffer;
+import org.apache.thrift.transport.TTransportException;
 import org.junit.jupiter.api.Test;
 
 public class TestPartialThriftDeserializer {
@@ -121,6 +131,118 @@ public class TestPartialThriftDeserializer {
     ts2 = (TestStruct) partialCompactDeserializer.partialDeserializeObject(bytesCompact);
     validatePartialSimpleField(ts1, ts2);
     assertTrue(comparer.areEqual(ts1, ts2, sb), sb::toString);
+  }
+
+  @Test
+  public void testStructProcessorContainersDoNotPreallocateDeclaredSize() throws TException {
+    // The expected size comes from a container header on the wire; a peer can declare a count it
+    // never backs with data. Creating the container must not reserve capacity for that count.
+    ThriftStructProcessor processor = new ThriftStructProcessor();
+
+    Object list = processor.createNewList(Integer.MAX_VALUE);
+    processor.setListElement(list, 0, Integer.valueOf(0));
+    processor.setListElement(list, 1, Integer.valueOf(1));
+    // An out-of-order element is padded to its index.
+    processor.setListElement(list, 3, Integer.valueOf(3));
+    assertEquals(Arrays.asList(0, 1, null, 3), processor.prepareList(list));
+
+    Object map = processor.createNewMap(Integer.MAX_VALUE);
+    processor.setMapElement(map, 0, Integer.valueOf(0), Integer.valueOf(0));
+    assertEquals(1, ((Map<?, ?>) processor.prepareMap(map)).size());
+
+    Object set = processor.createNewSet(Integer.MAX_VALUE);
+    processor.setSetElement(set, 0, Integer.valueOf(0));
+    assertEquals(1, ((Set<?>) processor.prepareSet(set)).size());
+
+    // A negative count reserves nothing rather than failing.
+    assertTrue(((List<?>) processor.prepareList(processor.createNewList(-1))).isEmpty());
+    assertTrue(((Map<?, ?>) processor.prepareMap(processor.createNewMap(-1))).isEmpty());
+    assertTrue(((Set<?>) processor.prepareSet(processor.createNewSet(-1))).isEmpty());
+  }
+
+  /**
+   * A container header is read before any of its elements, so a peer can declare an element count
+   * that it never backs with data. Partial deserialization must not reserve capacity for that count
+   * up front: it has to fail once the data actually sent runs out, not on an outsized allocation.
+   */
+  @Test
+  public void testDeclaredContainerSizeIsNotPreallocated() throws TException {
+    List<String> fieldNames = Arrays.asList("structList", "structSet", "structMap");
+
+    for (TProtocolFactory factory : Arrays.asList(binaryProtocolFactory, compactProtocolFactory)) {
+      TDeserializer partialDeserializer = new TDeserializer(TestStruct.class, fieldNames, factory);
+
+      // An empty struct has no minimum serialized size in these protocols, so a container of
+      // structs may declare any count at all, however few bytes actually follow.
+      for (byte containerType : new byte[] {TType.LIST, TType.SET, TType.MAP}) {
+        byte[] bytes = serializeOversizedStructContainer(factory, containerType);
+        // The elements that were sent are read; the read then runs out of data.
+        assertThrows(
+            TTransportException.class,
+            () -> partialDeserializer.partialDeserializeObject(bytes),
+            "Reading a container shorter than its declared size should fail");
+      }
+    }
+  }
+
+  /**
+   * A list header declaring a large element count, with no element bytes after it, must not make
+   * partial deserialization allocate storage for the declared count.
+   */
+  @Test
+  public void testHugeDeclaredListCountWithoutDataDoesNotPreallocate() throws TException {
+    List<String> fieldNames = Collections.singletonList("byteList");
+
+    for (TProtocolFactory factory : Arrays.asList(binaryProtocolFactory, compactProtocolFactory)) {
+      TDeserializer partialDeserializer = new TDeserializer(TestStruct.class, fieldNames, factory);
+
+      TMemoryBuffer buf = new TMemoryBuffer(0);
+      TProtocol proto = factory.getProtocol(buf);
+      proto.writeStructBegin(new TStruct("TestStruct"));
+      proto.writeFieldBegin(new TField("byteList", TType.LIST, (short) 10));
+      proto.writeListBegin(new TList(TType.BYTE, 50_000_000));
+      // No element bytes follow the header.
+      byte[] bytes = Arrays.copyOf(buf.getArray(), buf.length());
+
+      assertThrows(
+          TTransportException.class,
+          () -> partialDeserializer.partialDeserializeObject(bytes),
+          "Reading a list with no backing elements should fail on missing data");
+    }
+  }
+
+  /**
+   * Serializes the start of a TestStruct holding a single container-of-SmallStruct field whose
+   * header declares Integer.MAX_VALUE elements, followed by just two (empty) elements.
+   */
+  private byte[] serializeOversizedStructContainer(TProtocolFactory factory, byte containerType)
+      throws TException {
+    TMemoryBuffer buf = new TMemoryBuffer(0);
+    TProtocol proto = factory.getProtocol(buf);
+
+    proto.writeStructBegin(new TStruct("TestStruct"));
+    int elements = 2;
+    switch (containerType) {
+      case TType.LIST:
+        proto.writeFieldBegin(new TField("structList", TType.LIST, (short) 20));
+        proto.writeListBegin(new TList(TType.STRUCT, Integer.MAX_VALUE));
+        break;
+      case TType.SET:
+        proto.writeFieldBegin(new TField("structSet", TType.SET, (short) 40));
+        proto.writeSetBegin(new TSet(TType.STRUCT, Integer.MAX_VALUE));
+        break;
+      default:
+        proto.writeFieldBegin(new TField("structMap", TType.MAP, (short) 60));
+        proto.writeMapBegin(new TMap(TType.STRUCT, TType.STRUCT, Integer.MAX_VALUE));
+        elements = 4; // two keys and two values
+        break;
+    }
+    for (int i = 0; i < elements; i++) {
+      new SmallStruct().write(proto);
+    }
+    // The data ends here, short of the element count the header declared.
+
+    return Arrays.copyOf(buf.getArray(), buf.length());
   }
 
   private void validatePartialSimpleField(TestStruct ts1, TestStruct ts2) {
